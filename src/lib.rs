@@ -41,6 +41,8 @@ impl<'a, T: Send + 'static> Guard<'a, T> {
 
             let quiescent = self.ebr.global_quiescent_epoch.load(Acquire);
 
+            assert!(global_current_epoch > quiescent);
+
             while self
                 .ebr
                 .garbage_queue
@@ -90,6 +92,8 @@ impl Registry {
             .expect("unknown id deregistered from Ebr");
     }
 
+    // determine the minimum global epoch by scanning each
+    // local quiescent epoch.
     fn min_epoch(&self) -> u64 {
         let min = self
             .tenants
