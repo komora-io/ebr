@@ -29,48 +29,6 @@ const BUMP_EPOCH_OPS: u64 = 1024;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
 const GARBAGE_SLOTS_PER_BAG: usize = 128;
 
-pub struct Guard<'a, T: Send + 'static> {
-    ebr: &'a mut Ebr<T>,
-}
-
-impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
-    fn drop(&mut self) {
-        // set this to a large number to ensure it is not counted by `min_epoch()`
-        self.ebr.local_quiescent_epoch.store(u64::MAX, Release);
-    }
-}
-
-impl<'a, T: Send + 'static> Guard<'a, T> {
-    pub fn defer_drop(&mut self, item: T) {
-        self.ebr.current_garbage_bag.push(item);
-
-        if self.ebr.current_garbage_bag.is_full() {
-            let mut full_bag = take(&mut self.ebr.current_garbage_bag);
-            let global_current_epoch = self.ebr.global_current_epoch.load(Acquire);
-            full_bag.seal(global_current_epoch);
-            self.ebr.garbage_queue.push_back(full_bag);
-
-            let quiescent = self.ebr.global_quiescent_epoch.load(Acquire);
-
-            assert!(global_current_epoch > quiescent);
-
-            while self
-                .ebr
-                .garbage_queue
-                .front()
-                .unwrap()
-                .final_epoch
-                .unwrap()
-                .get()
-                < quiescent
-            {
-                let bag = self.ebr.garbage_queue.pop_front().unwrap();
-                drop(bag);
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct Ebr<T: Send + 'static> {
     // total collector count for id generation
@@ -107,6 +65,27 @@ pub struct Ebr<T: Send + 'static> {
     pins: u64,
 }
 
+impl<T: Send + 'static> Drop for Ebr<T> {
+    fn drop(&mut self) {
+        // Send all outstanding garbage to the orphan queue.
+        for old_bag in take(&mut self.garbage_queue) {
+            self.orphan_sender.send(old_bag).unwrap();
+        }
+
+        if self.current_garbage_bag.len > 0 {
+            let mut full_bag = take(&mut self.current_garbage_bag);
+            full_bag.seal(self.global_current_epoch.load(Acquire));
+            self.orphan_sender.send(full_bag).unwrap();
+        }
+
+        self.registry
+            .write()
+            .unwrap()
+            .remove(&self.local_id)
+            .expect("unknown id deregistered from Ebr");
+    }
+}
+
 impl<T: Send + 'static> Default for Ebr<T> {
     fn default() -> Ebr<T> {
         let collectors = Arc::new(AtomicU64::new(0));
@@ -132,6 +111,33 @@ impl<T: Send + 'static> Default for Ebr<T> {
             current_garbage_bag: Bag::default(),
             maintenance_lock: Arc::new(Mutex::new(rx)),
             orphan_sender: tx,
+            pins: 0,
+        }
+    }
+}
+
+impl<T: Send + 'static> Clone for Ebr<T> {
+    fn clone(&self) -> Ebr<T> {
+        let local_id = self.collectors.fetch_add(1, Relaxed);
+        let global_current_epoch = self.global_current_epoch.load(Acquire);
+
+        let local_quiescent_epoch = Arc::new(AtomicU64::new(global_current_epoch));
+        self.registry
+            .write()
+            .unwrap()
+            .insert(local_id, local_quiescent_epoch.clone());
+
+        Ebr {
+            collectors: self.collectors.clone(),
+            registry: self.registry.clone(),
+            local_id,
+            local_quiescent_epoch,
+            global_quiescent_epoch: self.global_quiescent_epoch.clone(),
+            global_current_epoch: self.global_current_epoch.clone(),
+            garbage_queue: Default::default(),
+            current_garbage_bag: Bag::default(),
+            maintenance_lock: self.maintenance_lock.clone(),
+            orphan_sender: self.orphan_sender.clone(),
             pins: 0,
         }
     }
@@ -194,51 +200,45 @@ impl<T: Send + 'static> Ebr<T> {
     }
 }
 
-impl<T: Send + 'static> Clone for Ebr<T> {
-    fn clone(&self) -> Ebr<T> {
-        let local_id = self.collectors.fetch_add(1, Relaxed);
-        let global_current_epoch = self.global_current_epoch.load(Acquire);
+pub struct Guard<'a, T: Send + 'static> {
+    ebr: &'a mut Ebr<T>,
+}
 
-        let local_quiescent_epoch = Arc::new(AtomicU64::new(global_current_epoch));
-        self.registry
-            .write()
-            .unwrap()
-            .insert(local_id, local_quiescent_epoch.clone());
-
-        Ebr {
-            collectors: self.collectors.clone(),
-            registry: self.registry.clone(),
-            local_id,
-            local_quiescent_epoch,
-            global_quiescent_epoch: self.global_quiescent_epoch.clone(),
-            global_current_epoch: self.global_current_epoch.clone(),
-            garbage_queue: Default::default(),
-            current_garbage_bag: Bag::default(),
-            maintenance_lock: self.maintenance_lock.clone(),
-            orphan_sender: self.orphan_sender.clone(),
-            pins: 0,
-        }
+impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
+    fn drop(&mut self) {
+        // set this to a large number to ensure it is not counted by `min_epoch()`
+        self.ebr.local_quiescent_epoch.store(u64::MAX, Release);
     }
 }
 
-impl<T: Send + 'static> Drop for Ebr<T> {
-    fn drop(&mut self) {
-        // Send all outstanding garbage to the orphan queue.
-        for old_bag in take(&mut self.garbage_queue) {
-            self.orphan_sender.send(old_bag).unwrap();
-        }
+impl<'a, T: Send + 'static> Guard<'a, T> {
+    pub fn defer_drop(&mut self, item: T) {
+        self.ebr.current_garbage_bag.push(item);
 
-        if self.current_garbage_bag.len > 0 {
-            let mut full_bag = take(&mut self.current_garbage_bag);
-            full_bag.seal(self.global_current_epoch.load(Acquire));
-            self.orphan_sender.send(full_bag).unwrap();
-        }
+        if self.ebr.current_garbage_bag.is_full() {
+            let mut full_bag = take(&mut self.ebr.current_garbage_bag);
+            let global_current_epoch = self.ebr.global_current_epoch.load(Acquire);
+            full_bag.seal(global_current_epoch);
+            self.ebr.garbage_queue.push_back(full_bag);
 
-        self.registry
-            .write()
-            .unwrap()
-            .remove(&self.local_id)
-            .expect("unknown id deregistered from Ebr");
+            let quiescent = self.ebr.global_quiescent_epoch.load(Acquire);
+
+            assert!(global_current_epoch > quiescent);
+
+            while self
+                .ebr
+                .garbage_queue
+                .front()
+                .unwrap()
+                .final_epoch
+                .unwrap()
+                .get()
+                < quiescent
+            {
+                let bag = self.ebr.garbage_queue.pop_front().unwrap();
+                drop(bag);
+            }
+        }
     }
 }
 
@@ -257,10 +257,6 @@ impl<T> Drop for Bag<T> {
             }
         }
     }
-}
-
-fn uninit_array<T, const LEN: usize>() -> [MaybeUninit<T>; LEN] {
-    unsafe { MaybeUninit::<[MaybeUninit<T>; LEN]>::uninit().assume_init() }
 }
 
 impl<T> Bag<T> {
@@ -286,7 +282,9 @@ impl<T: Send + 'static> Default for Bag<T> {
         Bag {
             final_epoch: None,
             len: 0,
-            garbage: uninit_array::<T, GARBAGE_SLOTS_PER_BAG>(),
+            garbage: unsafe {
+                MaybeUninit::<[MaybeUninit<T>; GARBAGE_SLOTS_PER_BAG]>::uninit().assume_init()
+            },
         }
     }
 }
