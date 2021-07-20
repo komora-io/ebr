@@ -1,4 +1,14 @@
-//! Epoch-based reclamation.
+//! Simple, low cacheline ping-pong epoch-based reclamation (EBR).
+//!
+//! ```rust
+//! use ebr::Ebr;
+//!
+//! let mut ebr: Ebr<Box<u64>> = Ebr::default();
+//!
+//! let mut guard = ebr.pin();
+//!
+//! guard.defer_drop(Box::new(1));
+//! ```
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -25,6 +35,7 @@ pub struct Guard<'a, T: Send + 'static> {
 
 impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
     fn drop(&mut self) {
+        // set this to a large number to ensure it is not counted by `min_epoch()`
         self.ebr.local_quiescent_epoch.store(u64::MAX, Release);
     }
 }
