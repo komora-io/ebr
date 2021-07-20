@@ -16,11 +16,17 @@ use std::{
 };
 
 const BUMP_EPOCH_OPS: u64 = 1024;
-const GARBAGE_SLOTS_PER_BAG: usize = 64;
-static COLLECTORS: AtomicU64 = AtomicU64::new(0);
+const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
+const GARBAGE_SLOTS_PER_BAG: usize = 128;
 
 pub struct Guard<'a, T: Send + 'static> {
     ebr: &'a mut Ebr<T>,
+}
+
+impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
+    fn drop(&mut self) {
+        self.ebr.local_quiescent_epoch.store(u64::MAX, Release);
+    }
 }
 
 impl<'a, T: Send + 'static> Guard<'a, T> {
@@ -29,7 +35,8 @@ impl<'a, T: Send + 'static> Guard<'a, T> {
 
         if self.ebr.current_garbage_bag.is_full() {
             let mut full_bag = take(&mut self.ebr.current_garbage_bag);
-            full_bag.seal(self.ebr.global_current_epoch.load(Acquire));
+            let global_current_epoch = self.ebr.global_current_epoch.load(Acquire);
+            full_bag.seal(global_current_epoch);
             self.ebr.garbage_queue.push_back(full_bag);
 
             let quiescent = self.ebr.global_quiescent_epoch.load(Acquire);
@@ -97,14 +104,12 @@ impl Registry {
 
         min
     }
-
-    fn min_id(&self) -> u64 {
-        *self.tenants.read().unwrap().keys().next().unwrap()
-    }
 }
 
 #[derive(Debug)]
 pub struct Ebr<T: Send + 'static> {
+    // total collector count
+    collectors: Arc<AtomicU64>,
     // the unique ID for this Ebr handle
     local_id: u64,
     // the quiescent epoch for this Ebr handle
@@ -124,18 +129,21 @@ pub struct Ebr<T: Send + 'static> {
 impl<T: Send + 'static> Default for Ebr<T> {
     fn default() -> Ebr<T> {
         let registry = Registry::default();
-        let local_id = COLLECTORS.fetch_add(1, Relaxed);
-        let quiescent_epoch = 0;
+        let collectors = Arc::new(AtomicU64::new(0));
+        let local_id = collectors.fetch_add(1, Relaxed);
+        let current_epoch = 1;
+        let quiescent_epoch = current_epoch - 1;
         let local_quiescent_epoch = registry.register(local_id, quiescent_epoch);
 
         let (tx, rx) = channel();
 
         Ebr {
+            collectors,
             registry,
             local_id,
             local_quiescent_epoch,
+            global_current_epoch: Arc::new(AtomicU64::new(current_epoch)),
             global_quiescent_epoch: Arc::new(AtomicU64::new(quiescent_epoch)),
-            global_current_epoch: Arc::new(AtomicU64::new(quiescent_epoch + 1)),
             garbage_queue: Default::default(),
             current_garbage_bag: Bag::default(),
             maintenance_lock: Arc::new(Mutex::new(rx)),
@@ -147,44 +155,48 @@ impl<T: Send + 'static> Default for Ebr<T> {
 
 impl<T: Send + 'static> Ebr<T> {
     pub fn pin(&mut self) -> Guard<'_, T> {
-        self.maintenance();
+        self.pins += 1;
+
+        let global_current_epoch = self.global_current_epoch.load(Relaxed);
+        self.local_quiescent_epoch
+            .store(global_current_epoch, Release);
+
+        let should_bump_epoch = self.pins.trailing_zeros() == BUMP_EPOCH_TRAILING_ZEROS;
+        if should_bump_epoch {
+            self.maintenance();
+        }
+
         Guard { ebr: self }
     }
 
+    #[cold]
     fn maintenance(&mut self) {
-        self.pins += 1;
-        let should_bump_epoch = self.pins % BUMP_EPOCH_OPS == 0;
-        if !should_bump_epoch {
+        self.global_current_epoch.fetch_add(1, Relaxed);
+
+        let orphans_rx = if let Ok(orphans_rx) = self.maintenance_lock.try_lock() {
+            orphans_rx
+        } else {
             return;
-        }
+        };
 
-        if self.registry.min_id() == self.local_id {
-            // we have been "elected" global maintainer,
-            // which has sole responsibility for:
-            // * incrementing the global epoch
-            // * bumping the global quiescent epoch
-            // * clearing the orphan garbage queue
+        // we have now been "elected" global maintainer,
+        // which has responsibility for:
+        // * incrementing the global epoch
+        // * bumping the global quiescent epoch
+        // * clearing the orphan garbage queue
 
-            self.global_current_epoch.fetch_add(1, Release);
+        let global_quiescent_epoch = self.registry.min_epoch();
 
-            let global_quiescent_epoch = self.registry.min_epoch();
-            self.global_quiescent_epoch
-                .store(global_quiescent_epoch, Release);
+        assert_ne!(global_quiescent_epoch, u64::MAX);
 
-            let rx = self.maintenance_lock.try_lock().expect(
-                "we won the election for \
-                 maintenance thread, so we \
-                 should always be able to \
-                 perform maintenance \
-                 without blocking",
-            );
+        self.global_quiescent_epoch
+            .fetch_max(global_quiescent_epoch, Release);
 
-            while let Ok(bag) = rx.try_recv() {
-                if bag.final_epoch.unwrap().get() < global_quiescent_epoch {
-                    drop(bag)
-                } else {
-                    self.garbage_queue.push_back(bag);
-                }
+        while let Ok(bag) = orphans_rx.try_recv() {
+            if bag.final_epoch.unwrap().get() < global_quiescent_epoch {
+                drop(bag)
+            } else {
+                self.garbage_queue.push_back(bag);
             }
         }
     }
@@ -192,11 +204,12 @@ impl<T: Send + 'static> Ebr<T> {
 
 impl<T: Send + 'static> Clone for Ebr<T> {
     fn clone(&self) -> Ebr<T> {
-        let local_id = COLLECTORS.fetch_add(1, Relaxed);
+        let local_id = self.collectors.fetch_add(1, Relaxed);
         let global_current_epoch = self.global_current_epoch.load(Acquire);
-        let local_quiescent_epoch = self.registry.register(local_id, global_current_epoch);
+        let local_quiescent_epoch = self.registry.register(local_id, global_current_epoch - 1);
 
         Ebr {
+            collectors: self.collectors.clone(),
             registry: self.registry.clone(),
             local_id,
             local_quiescent_epoch,
