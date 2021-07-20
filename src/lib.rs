@@ -1,4 +1,4 @@
-//! Simple, low cacheline ping-pong epoch-based reclamation (EBR).
+//! Simple, CPU cache-friendly epoch-based reclamation (EBR).
 //!
 //! ```rust
 //! use ebr::Ebr;
@@ -71,90 +71,59 @@ impl<'a, T: Send + 'static> Guard<'a, T> {
     }
 }
 
-/// A registry for tracking tenancy in various epochs.
-#[derive(Debug, Clone)]
-pub struct Registry {
-    tenants: Arc<RwLock<BTreeMap<u64, Arc<AtomicU64>>>>,
-}
-
-impl Default for Registry {
-    fn default() -> Registry {
-        Registry {
-            tenants: Default::default(),
-        }
-    }
-}
-
-impl Registry {
-    fn register(&self, id: u64, quiescent_epoch: u64) -> Arc<AtomicU64> {
-        let epoch_tracker = Arc::new(AtomicU64::new(quiescent_epoch));
-        self.tenants
-            .write()
-            .unwrap()
-            .insert(id, epoch_tracker.clone());
-        epoch_tracker
-    }
-
-    fn deregister(&self, id: u64) {
-        self.tenants
-            .write()
-            .unwrap()
-            .remove(&id)
-            .expect("unknown id deregistered from Ebr");
-    }
-
-    // determine the minimum global epoch by scanning each
-    // local quiescent epoch.
-    fn min_epoch(&self) -> u64 {
-        let min = self
-            .tenants
-            .read()
-            .unwrap()
-            .values()
-            .map(|v| v.load(Relaxed))
-            .min()
-            .unwrap();
-
-        fence(Release);
-
-        min
-    }
-}
-
 #[derive(Debug)]
 pub struct Ebr<T: Send + 'static> {
-    // total collector count
+    // total collector count for id generation
     collectors: Arc<AtomicU64>,
+
     // the unique ID for this Ebr handle
     local_id: u64,
+
     // the quiescent epoch for this Ebr handle
     local_quiescent_epoch: Arc<AtomicU64>,
-    registry: Registry,
-    // the global minimum quiescent epoch across
-    // all registered Ebr handles
+
+    // map from collector id to its quiescent epoch
+    registry: Arc<RwLock<BTreeMap<u64, Arc<AtomicU64>>>>,
+
+    // the highest epoch that gc is safe for
     global_quiescent_epoch: Arc<AtomicU64>,
+
+    // new garbage gets assigned this epoch
     global_current_epoch: Arc<AtomicU64>,
+
+    // epoch-tagged garbage waiting to be safely dropped
     garbage_queue: VecDeque<Bag<T>>,
+
+    // new garbage accumulates here first
     current_garbage_bag: Bag<T>,
+
+    // receives garbage from terminated threads
     maintenance_lock: Arc<Mutex<Receiver<Bag<T>>>>,
+
+    // send outstanding garbage here when this Ebr drops
     orphan_sender: Sender<Bag<T>>,
+
+    // count of pin attempts from this collector
     pins: u64,
 }
 
 impl<T: Send + 'static> Default for Ebr<T> {
     fn default() -> Ebr<T> {
-        let registry = Registry::default();
         let collectors = Arc::new(AtomicU64::new(0));
         let local_id = collectors.fetch_add(1, Relaxed);
         let current_epoch = 1;
         let quiescent_epoch = current_epoch - 1;
-        let local_quiescent_epoch = registry.register(local_id, quiescent_epoch);
+
+        let local_quiescent_epoch = Arc::new(AtomicU64::new(quiescent_epoch));
+        let registry = vec![(local_id, local_quiescent_epoch.clone())]
+            .into_iter()
+            .collect();
 
         let (tx, rx) = channel();
 
         Ebr {
             collectors,
-            registry,
+            registry: Arc::new(RwLock::new(registry)),
             local_id,
             local_quiescent_epoch,
             global_current_epoch: Arc::new(AtomicU64::new(current_epoch)),
@@ -196,11 +165,19 @@ impl<T: Send + 'static> Ebr<T> {
 
         // we have now been "elected" global maintainer,
         // which has responsibility for:
-        // * incrementing the global epoch
         // * bumping the global quiescent epoch
         // * clearing the orphan garbage queue
 
-        let global_quiescent_epoch = self.registry.min_epoch();
+        let global_quiescent_epoch = self
+            .registry
+            .read()
+            .unwrap()
+            .values()
+            .map(|v| v.load(Relaxed))
+            .min()
+            .unwrap();
+
+        fence(Release);
 
         assert_ne!(global_quiescent_epoch, u64::MAX);
 
@@ -221,7 +198,12 @@ impl<T: Send + 'static> Clone for Ebr<T> {
     fn clone(&self) -> Ebr<T> {
         let local_id = self.collectors.fetch_add(1, Relaxed);
         let global_current_epoch = self.global_current_epoch.load(Acquire);
-        let local_quiescent_epoch = self.registry.register(local_id, global_current_epoch - 1);
+
+        let local_quiescent_epoch = Arc::new(AtomicU64::new(global_current_epoch));
+        self.registry
+            .write()
+            .unwrap()
+            .insert(local_id, local_quiescent_epoch.clone());
 
         Ebr {
             collectors: self.collectors.clone(),
@@ -242,9 +224,6 @@ impl<T: Send + 'static> Clone for Ebr<T> {
 impl<T: Send + 'static> Drop for Ebr<T> {
     fn drop(&mut self) {
         // Send all outstanding garbage to the orphan queue.
-        // This is safe to do even if we're the only
-        // instance, because everything in the queue will
-        // be dropped at the end of this call to drop anyway.
         for old_bag in take(&mut self.garbage_queue) {
             self.orphan_sender.send(old_bag).unwrap();
         }
@@ -255,7 +234,11 @@ impl<T: Send + 'static> Drop for Ebr<T> {
             self.orphan_sender.send(full_bag).unwrap();
         }
 
-        self.registry.deregister(self.local_id);
+        self.registry
+            .write()
+            .unwrap()
+            .remove(&self.local_id)
+            .expect("unknown id deregistered from Ebr");
     }
 }
 
@@ -282,7 +265,7 @@ fn uninit_array<T, const LEN: usize>() -> [MaybeUninit<T>; LEN] {
 
 impl<T> Bag<T> {
     fn push(&mut self, item: T) {
-        assert!(self.len < GARBAGE_SLOTS_PER_BAG);
+        debug_assert!(self.len < GARBAGE_SLOTS_PER_BAG);
         unsafe {
             self.garbage[self.len].as_mut_ptr().write(item);
         }
