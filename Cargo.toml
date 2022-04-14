@@ -10,3 +10,4 @@ categories = ["concurrency", "data-structures"]
 
 [dev-dependencies]
 crossbeam-utils = "0.8.5"
+crossbeam-epoch = "0.9.8"
