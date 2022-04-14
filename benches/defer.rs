@@ -5,7 +5,7 @@ extern crate test;
 use test::Bencher;
 
 use crossbeam_utils::thread::scope;
-use crossbeam_epoch::{Shared, Owned, pin as crossbeam_pin};
+use crossbeam_epoch::{Owned, pin as crossbeam_pin};
 
 const THREADS: usize = 16;
 const STEPS: usize = 10_000;
@@ -74,7 +74,7 @@ fn ebr_multi_defer(b: &mut Bencher) {
 #[bench]
 fn crossbeam_single_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
-        let mut guard = crossbeam_pin();
+        let guard = crossbeam_pin();
         unsafe {
             guard.defer_destroy(Owned::new(1).into_shared(&guard));
         }
@@ -84,7 +84,7 @@ fn crossbeam_single_alloc_defer_free(b: &mut Bencher) {
 #[bench]
 fn crossbeam_single_defer(b: &mut Bencher) {
     b.iter(|| {
-        let mut guard = crossbeam_pin();
+        let guard = crossbeam_pin();
         unsafe {
             guard.defer_destroy(Owned::new(()).into_shared(&guard));
         }
@@ -98,7 +98,7 @@ fn crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
             for _ in 0..THREADS {
                 s.spawn(move |_| {
                     for _ in 0..STEPS {
-                        let mut guard = crossbeam_pin();
+                        let guard = crossbeam_pin();
                         unsafe {
                             guard.defer_destroy(Owned::new(1).into_shared(&guard));
                         }
@@ -117,7 +117,7 @@ fn crossbeam_multi_defer(b: &mut Bencher) {
             for _ in 0..THREADS {
                 s.spawn(move |_| {
                     for _ in 0..STEPS {
-                        let mut guard = crossbeam_pin();
+                        let guard = crossbeam_pin();
                         unsafe {
                             guard.defer_destroy(Owned::new(()).into_shared(&guard));
                         }

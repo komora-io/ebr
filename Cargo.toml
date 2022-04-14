@@ -11,3 +11,6 @@ categories = ["concurrency", "data-structures"]
 [dev-dependencies]
 crossbeam-utils = "0.8.5"
 crossbeam-epoch = "0.9.8"
+
+[dependencies]
+shared-local-state = "0.1.0"
