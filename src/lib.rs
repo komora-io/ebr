@@ -17,7 +17,7 @@ use std::{
     sync::{
         atomic::{
             fence, AtomicU64,
-            Ordering::{Acquire, Relaxed, Release},
+            Ordering::{Acquire, Release},
         },
         mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
@@ -120,11 +120,9 @@ impl<T: Send + 'static> Ebr<T> {
     pub fn pin(&mut self) -> Guard<'_, T> {
         self.pins += 1;
 
-        let global_current_epoch = self.global_current_epoch.load(Relaxed);
+        let global_current_epoch = self.global_current_epoch.load(Acquire);
         self.local_progress_registry
-            .access_without_notification(|lqe| {
-                lqe.store(global_current_epoch, Release)
-            });
+            .access_without_notification(|lqe| lqe.store(global_current_epoch, Release));
 
         let should_bump_epoch = self.pins.trailing_zeros() == BUMP_EPOCH_TRAILING_ZEROS;
         if should_bump_epoch {
@@ -136,7 +134,7 @@ impl<T: Send + 'static> Ebr<T> {
 
     #[cold]
     fn maintenance(&mut self) {
-        self.global_current_epoch.fetch_add(1, Relaxed);
+        self.global_current_epoch.fetch_add(1, Release);
 
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
@@ -151,7 +149,7 @@ impl<T: Send + 'static> Ebr<T> {
 
         let global_quiescent_epoch = self
             .local_progress_registry
-            .fold(0, |min, this| min.min(this.load(Relaxed)));
+            .fold(0, |min, this| min.min(this.load(Acquire)));
 
         fence(Release);
 
@@ -177,8 +175,7 @@ pub struct Guard<'a, T: Send + 'static> {
 impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
     fn drop(&mut self) {
         // set this to a large number to ensure it is not counted by `min_epoch()`
-        self
-            .ebr
+        self.ebr
             .local_progress_registry
             .access_without_notification(|lqe| lqe.store(u64::MAX, Release));
     }
