@@ -1,12 +1,14 @@
 [package]
 name = "ebr"
-authors = ["Tyler Neely <t@jujit.su>"]
+authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "simple epoch-based reclamation with low cacheline ping-pong"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2018"
-license = "MIT/Apache-2.0"
+license = "GPL-3.0"
 repository = "https://github.com/komora-io/ebr"
-categories = ["concurrency", "data-structures"]
+keywords = ["epoch", "multi-threaded", "performance", "reclamation", "garbage"]
+categories = ["development-tools", "concurrency", "data-structures", "rust-patterns"]
+readme = "README.md"
 
 [dev-dependencies]
 crossbeam-utils = "0.8.5"
