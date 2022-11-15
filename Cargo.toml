@@ -2,7 +2,7 @@
 name = "ebr"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "simple epoch-based reclamation with low cacheline ping-pong"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2018"
 license = "GPL-3.0"
 repository = "https://github.com/komora-io/ebr"
