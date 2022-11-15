@@ -2,7 +2,7 @@
 name = "ebr"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "simple epoch-based reclamation with low cacheline ping-pong"
-version = "0.0.5"
+version = "0.1.38"
 edition = "2018"
 license = "GPL-3.0"
 repository = "https://github.com/komora-io/ebr"
@@ -11,7 +11,6 @@ categories = ["development-tools", "concurrency", "data-structures", "rust-patte
 readme = "README.md"
 
 [dev-dependencies]
-crossbeam-utils = "0.8.5"
 crossbeam-epoch = "0.9.8"
 
 [dependencies]

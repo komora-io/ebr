@@ -2,18 +2,18 @@
 
 extern crate test;
 
+use std::thread::scope;
+
 use test::Bencher;
 
-use crossbeam_utils::thread::scope;
-use crossbeam_epoch::{Owned, pin as crossbeam_pin};
+use crossbeam_epoch::{pin as crossbeam_pin, Owned};
 
 const THREADS: usize = 16;
 const STEPS: usize = 10_000;
 
-
 #[bench]
 fn ebr_single_alloc_defer_free(b: &mut Bencher) {
-    let mut ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
+    let ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
 
     b.iter(|| {
         let mut guard = ebr.pin();
@@ -23,7 +23,7 @@ fn ebr_single_alloc_defer_free(b: &mut Bencher) {
 
 #[bench]
 fn ebr_single_defer(b: &mut Bencher) {
-    let mut ebr: ebr::Ebr<()> = ebr::Ebr::default();
+    let ebr: ebr::Ebr<()> = ebr::Ebr::default();
 
     b.iter(|| {
         let mut guard = ebr.pin();
@@ -34,12 +34,12 @@ fn ebr_single_defer(b: &mut Bencher) {
 #[bench]
 fn ebr_multi_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
-        let ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
-
         scope(|s| {
+            let ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
+
             for _ in 0..THREADS {
-                let mut ebr = ebr.clone();
-                s.spawn(move |_| {
+                let ebr = ebr.clone();
+                s.spawn(move || {
                     for _ in 0..STEPS {
                         let mut guard = ebr.pin();
                         guard.defer_drop(Box::new(1));
@@ -47,7 +47,6 @@ fn ebr_multi_alloc_defer_free(b: &mut Bencher) {
                 });
             }
         })
-        .unwrap();
     });
 }
 
@@ -58,8 +57,8 @@ fn ebr_multi_defer(b: &mut Bencher) {
 
         scope(|s| {
             for _ in 0..THREADS {
-                let mut ebr = ebr.clone();
-                s.spawn(move |_| {
+                let ebr = ebr.clone();
+                s.spawn(move || {
                     for _ in 0..STEPS {
                         let mut guard = ebr.pin();
                         guard.defer_drop(());
@@ -67,7 +66,6 @@ fn ebr_multi_defer(b: &mut Bencher) {
                 });
             }
         })
-        .unwrap();
     });
 }
 
@@ -96,7 +94,7 @@ fn crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
         scope(|s| {
             for _ in 0..THREADS {
-                s.spawn(move |_| {
+                s.spawn(move || {
                     for _ in 0..STEPS {
                         let guard = crossbeam_pin();
                         unsafe {
@@ -106,7 +104,6 @@ fn crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
                 });
             }
         })
-        .unwrap();
     });
 }
 
@@ -115,7 +112,7 @@ fn crossbeam_multi_defer(b: &mut Bencher) {
     b.iter(|| {
         scope(|s| {
             for _ in 0..THREADS {
-                s.spawn(move |_| {
+                s.spawn(move || {
                     for _ in 0..STEPS {
                         let guard = crossbeam_pin();
                         unsafe {
@@ -125,6 +122,5 @@ fn crossbeam_multi_defer(b: &mut Bencher) {
                 });
             }
         })
-        .unwrap();
     });
 }
