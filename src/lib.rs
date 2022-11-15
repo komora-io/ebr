@@ -31,6 +31,14 @@ const BUMP_EPOCH_OPS: u64 = 128;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
 const GARBAGE_SLOTS_PER_BAG: usize = 128;
 
+#[test]
+fn test_impls() {
+    fn send<T: Send>() {}
+
+    send::<Ebr<()>>();
+    send::<Inner<()>>();
+}
+
 #[derive(Debug)]
 pub struct Ebr<T: Send + 'static> {
     inner: RefCell<Inner<T>>,
