@@ -3,7 +3,7 @@
 //! ```rust
 //! use ebr::Ebr;
 //!
-//! let mut ebr: Ebr<Box<u64>> = Ebr::default();
+//! let ebr: Ebr<Box<u64>> = Ebr::default();
 //!
 //! let mut guard = ebr.pin();
 //!
