@@ -29,22 +29,51 @@ use shared_local_state::SharedLocalState;
 
 const BUMP_EPOCH_OPS: u64 = 128;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
-const GARBAGE_SLOTS_PER_BAG: usize = 128;
 
-#[test]
-fn test_impls() {
+fn _test_impls() {
     fn send<T: Send>() {}
 
     send::<Ebr<()>>();
-    send::<Inner<()>>();
+    send::<Inner<(), 128>>();
 }
 
+/// Epoch-based garbage collector with extremely efficient
+/// single-threaded operations in the hot-path.
+///
+/// The `SLOTS` const generic specifies how large the local
+/// garbage bags should be allowed to grow before marking
+/// them with the current monotonic timestamp and placing
+/// them into a local queue for destruction.
+///
+/// If an `Ebr` is dropped while it has un-reclaimed garbage,
+/// it sends its current garbage bag to another thread
+/// to cooperatively reclaim after any potentially witnessing
+/// thread has finished its work.
 #[derive(Debug)]
-pub struct Ebr<T: Send + 'static> {
-    inner: RefCell<Inner<T>>,
+pub struct Ebr<T: Send + 'static, const SLOTS: usize = 128> {
+    inner: RefCell<Inner<T, SLOTS>>,
 }
 
-impl<T: Send + 'static> Clone for Ebr<T> {
+impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
+    pub fn pin(&self) -> Guard<'_, T, SLOTS> {
+        let mut inner = self.inner.borrow_mut();
+        inner.pins += 1;
+
+        let global_current_epoch = inner.global_current_epoch.load(Acquire);
+        inner
+            .local_progress_registry
+            .access_without_notification(|lqe| lqe.store(global_current_epoch, Release));
+
+        let should_bump_epoch = inner.pins.trailing_zeros() == BUMP_EPOCH_TRAILING_ZEROS;
+        if should_bump_epoch {
+            inner.maintenance();
+        }
+
+        Guard { ebr: &self.inner }
+    }
+}
+
+impl<T: Send + 'static, const SLOTS: usize> Clone for Ebr<T, SLOTS> {
     fn clone(&self) -> Self {
         Ebr {
             inner: RefCell::new(self.inner.borrow().clone()),
@@ -52,8 +81,8 @@ impl<T: Send + 'static> Clone for Ebr<T> {
     }
 }
 
-impl<T: Send + 'static> Default for Ebr<T> {
-    fn default() -> Ebr<T> {
+impl<T: Send + 'static, const SLOTS: usize> Default for Ebr<T, SLOTS> {
+    fn default() -> Ebr<T, SLOTS> {
         Ebr {
             inner: Default::default(),
         }
@@ -61,7 +90,7 @@ impl<T: Send + 'static> Default for Ebr<T> {
 }
 
 #[derive(Debug)]
-pub struct Inner<T: Send + 'static> {
+pub struct Inner<T: Send + 'static, const SLOTS: usize> {
     // shared quiescent epochs
     local_progress_registry: SharedLocalState<AtomicU64>,
 
@@ -72,22 +101,22 @@ pub struct Inner<T: Send + 'static> {
     global_current_epoch: Arc<AtomicU64>,
 
     // epoch-tagged garbage waiting to be safely dropped
-    garbage_queue: VecDeque<Bag<T>>,
+    garbage_queue: VecDeque<Bag<T, SLOTS>>,
 
     // new garbage accumulates here first
-    current_garbage_bag: Bag<T>,
+    current_garbage_bag: Bag<T, SLOTS>,
 
     // receives garbage from terminated threads
-    maintenance_lock: Arc<Mutex<Receiver<Bag<T>>>>,
+    maintenance_lock: Arc<Mutex<Receiver<Bag<T, SLOTS>>>>,
 
     // send outstanding garbage here when this Ebr drops
-    orphan_tx: Sender<Bag<T>>,
+    orphan_tx: Sender<Bag<T, SLOTS>>,
 
     // count of pin attempts from this collector
     pins: u64,
 }
 
-impl<T: Send + 'static> Drop for Inner<T> {
+impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
     fn drop(&mut self) {
         // Send all outstanding garbage to the orphan queue.
         for old_bag in take(&mut self.garbage_queue) {
@@ -102,8 +131,8 @@ impl<T: Send + 'static> Drop for Inner<T> {
     }
 }
 
-impl<T: Send + 'static> Default for Inner<T> {
-    fn default() -> Inner<T> {
+impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
+    fn default() -> Inner<T, SLOTS> {
         let current_epoch = 1;
         let quiescent_epoch = current_epoch - 1;
 
@@ -125,8 +154,8 @@ impl<T: Send + 'static> Default for Inner<T> {
     }
 }
 
-impl<T: Send + 'static> Clone for Inner<T> {
-    fn clone(&self) -> Inner<T> {
+impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
+    fn clone(&self) -> Inner<T, SLOTS> {
         let global_current_epoch = self.global_current_epoch.load(Acquire);
 
         let local_quiescent_epoch = AtomicU64::new(global_current_epoch);
@@ -146,26 +175,7 @@ impl<T: Send + 'static> Clone for Inner<T> {
     }
 }
 
-impl<T: Send + 'static> Ebr<T> {
-    pub fn pin(&self) -> Guard<'_, T> {
-        let mut inner = self.inner.borrow_mut();
-        inner.pins += 1;
-
-        let global_current_epoch = inner.global_current_epoch.load(Acquire);
-        inner
-            .local_progress_registry
-            .access_without_notification(|lqe| lqe.store(global_current_epoch, Release));
-
-        let should_bump_epoch = inner.pins.trailing_zeros() == BUMP_EPOCH_TRAILING_ZEROS;
-        if should_bump_epoch {
-            inner.maintenance();
-        }
-
-        Guard { ebr: &self.inner }
-    }
-}
-
-impl<T: Send + 'static> Inner<T> {
+impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
     #[cold]
     fn maintenance(&mut self) {
         let last_epoch = self.global_current_epoch.fetch_add(1, Release);
@@ -202,11 +212,11 @@ impl<T: Send + 'static> Inner<T> {
     }
 }
 
-pub struct Guard<'a, T: Send + 'static> {
-    ebr: &'a RefCell<Inner<T>>,
+pub struct Guard<'a, T: Send + 'static, const SLOTS: usize> {
+    ebr: &'a RefCell<Inner<T, SLOTS>>,
 }
 
-impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
+impl<'a, T: Send + 'static, const SLOTS: usize> Drop for Guard<'a, T, SLOTS> {
     fn drop(&mut self) {
         // set this to a large number to ensure it is not counted by `min_epoch()`
         let inner = self.ebr.borrow();
@@ -216,7 +226,7 @@ impl<'a, T: Send + 'static> Drop for Guard<'a, T> {
     }
 }
 
-impl<'a, T: Send + 'static> Guard<'a, T> {
+impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
     pub fn defer_drop(&mut self, item: T) {
         let mut ebr = self.ebr.borrow_mut();
         ebr.current_garbage_bag.push(item);
@@ -254,13 +264,13 @@ impl<'a, T: Send + 'static> Guard<'a, T> {
 }
 
 #[derive(Debug)]
-struct Bag<T> {
-    garbage: [MaybeUninit<T>; GARBAGE_SLOTS_PER_BAG],
+struct Bag<T, const SLOTS: usize> {
+    garbage: [MaybeUninit<T>; SLOTS],
     final_epoch: Option<NonZeroU64>,
     len: usize,
 }
 
-impl<T> Drop for Bag<T> {
+impl<T, const SLOTS: usize> Drop for Bag<T, SLOTS> {
     fn drop(&mut self) {
         for index in 0..self.len {
             unsafe {
@@ -270,9 +280,9 @@ impl<T> Drop for Bag<T> {
     }
 }
 
-impl<T> Bag<T> {
+impl<T, const SLOTS: usize> Bag<T, SLOTS> {
     fn push(&mut self, item: T) {
-        debug_assert!(self.len < GARBAGE_SLOTS_PER_BAG);
+        debug_assert!(self.len < SLOTS);
         unsafe {
             self.garbage[self.len].as_mut_ptr().write(item);
         }
@@ -280,7 +290,7 @@ impl<T> Bag<T> {
     }
 
     const fn is_full(&self) -> bool {
-        self.len == GARBAGE_SLOTS_PER_BAG
+        self.len == SLOTS
     }
 
     fn seal(&mut self, epoch: u64) {
@@ -288,14 +298,12 @@ impl<T> Bag<T> {
     }
 }
 
-impl<T: Send + 'static> Default for Bag<T> {
-    fn default() -> Bag<T> {
+impl<T: Send + 'static, const SLOTS: usize> Default for Bag<T, SLOTS> {
+    fn default() -> Bag<T, SLOTS> {
         Bag {
             final_epoch: None,
             len: 0,
-            garbage: unsafe {
-                MaybeUninit::<[MaybeUninit<T>; GARBAGE_SLOTS_PER_BAG]>::uninit().assume_init()
-            },
+            garbage: unsafe { MaybeUninit::<[MaybeUninit<T>; SLOTS]>::uninit().assume_init() },
         }
     }
 }
