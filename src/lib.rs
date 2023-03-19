@@ -64,7 +64,7 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
             .local_progress_registry
             .access_without_notification(|lqe| lqe.store(global_current_epoch, Release));
 
-        let should_bump_epoch = inner.pins.trailing_zeros() == BUMP_EPOCH_TRAILING_ZEROS;
+        let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_TRAILING_ZEROS;
         if should_bump_epoch {
             inner.maintenance();
         }
@@ -136,8 +136,8 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
         let current_epoch = 1;
         let quiescent_epoch = current_epoch - 1;
 
-        let local_quiescent_epoch = AtomicU64::new(quiescent_epoch);
-        let local_progress_registry = SharedLocalState::new(local_quiescent_epoch);
+        let local_epoch = AtomicU64::new(u64::MAX);
+        let local_progress_registry = SharedLocalState::new(local_epoch);
 
         let (orphan_tx, orphan_rx) = channel();
 
@@ -156,9 +156,7 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
 
 impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
     fn clone(&self) -> Inner<T, SLOTS> {
-        let global_current_epoch = self.global_current_epoch.load(Acquire);
-
-        let local_quiescent_epoch = AtomicU64::new(global_current_epoch);
+        let local_quiescent_epoch = AtomicU64::new(u64::MAX);
 
         let local_progress_registry = self.local_progress_registry.insert(local_quiescent_epoch);
 
@@ -179,7 +177,6 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
     #[cold]
     fn maintenance(&mut self) {
         let last_epoch = self.global_current_epoch.fetch_add(1, Release);
-
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
         } else {
@@ -254,7 +251,7 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
                 .final_epoch
                 .unwrap()
                 .get()
-                < quiescent
+                <= quiescent
             {
                 let bag = ebr.garbage_queue.pop_front().unwrap();
                 drop(bag);
