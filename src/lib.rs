@@ -134,7 +134,6 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
 impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
     fn default() -> Inner<T, SLOTS> {
         let current_epoch = 1;
-        let quiescent_epoch = current_epoch - 1;
 
         let local_epoch = AtomicU64::new(u64::MAX);
         let local_progress_registry = SharedLocalState::new(local_epoch);
@@ -144,7 +143,7 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
         Inner {
             local_progress_registry,
             global_current_epoch: Arc::new(AtomicU64::new(current_epoch)),
-            global_minimum_epoch: Arc::new(AtomicU64::new(quiescent_epoch)),
+            global_minimum_epoch: Arc::new(AtomicU64::new(current_epoch)),
             garbage_queue: Default::default(),
             current_garbage_bag: Bag::default(),
             maintenance_lock: Arc::new(Mutex::new(orphan_rx)),
@@ -232,9 +231,12 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
             let mut full_bag = take(&mut ebr.current_garbage_bag);
             let global_current_epoch = ebr.global_current_epoch.load(Acquire);
             full_bag.seal(global_current_epoch);
+
             ebr.garbage_queue.push_back(full_bag);
 
-            let quiescent = ebr.global_minimum_epoch.load(Acquire).saturating_sub(1);
+            let global_minimum_epoch = ebr.global_minimum_epoch.load(Acquire);
+            assert!(global_minimum_epoch >= 1);
+            let quiescent = global_minimum_epoch.checked_sub(1).unwrap();
 
             assert!(
                 global_current_epoch > quiescent,
@@ -244,15 +246,11 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
                 quiescent
             );
 
-            while ebr
-                .garbage_queue
-                .front()
-                .unwrap()
-                .final_epoch
-                .unwrap()
-                .get()
-                <= quiescent
-            {
+            while let Some(front) = ebr.garbage_queue.front() {
+                if front.final_epoch.unwrap().get() > quiescent {
+                    break;
+                }
+
                 let bag = ebr.garbage_queue.pop_front().unwrap();
                 drop(bag);
             }
