@@ -29,6 +29,19 @@ use shared_local_state::SharedLocalState;
 
 const BUMP_EPOCH_OPS: u64 = 128;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
+const INACTIVE_BIT: u64 = 0b1;
+const INACTIVE_MASK: u64 = u64::MAX - INACTIVE_BIT;
+
+#[cfg(not(feature = "lock_free_delays"))]
+#[inline]
+fn debug_delay() {}
+
+#[cfg(feature = "lock_free_delays")]
+fn debug_delay() {
+    for i in 0..2 {
+        std::thread::yield_now();
+    }
+}
 
 fn _test_impls() {
     fn send<T: Send>() {}
@@ -58,11 +71,19 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
     pub fn pin(&self) -> Guard<'_, T, SLOTS> {
         let mut inner = self.inner.borrow_mut();
         inner.pins += 1;
+        inner.local_concurrent_pins += 1;
 
+        debug_delay();
         let global_current_epoch = inner.global_current_epoch.load(Acquire);
-        inner
-            .local_progress_registry
-            .access_without_notification(|lqe| lqe.store(global_current_epoch, Release));
+
+        if inner.local_concurrent_pins == 1 {
+            debug_delay();
+            inner
+                .local_progress_registry
+                .access_without_notification(|lqe| {
+                    lqe.store(global_current_epoch, Release);
+                });
+        }
 
         let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_TRAILING_ZEROS;
         if should_bump_epoch {
@@ -114,6 +135,9 @@ pub struct Inner<T: Send + 'static, const SLOTS: usize> {
 
     // count of pin attempts from this collector
     pins: u64,
+
+    // pins on this thread
+    local_concurrent_pins: usize,
 }
 
 impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
@@ -125,6 +149,7 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
 
         if self.current_garbage_bag.len > 0 {
             let mut full_bag = take(&mut self.current_garbage_bag);
+            debug_delay();
             full_bag.seal(self.global_current_epoch.load(Acquire));
             self.orphan_tx.send(full_bag).unwrap();
         }
@@ -133,9 +158,9 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
 
 impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
     fn default() -> Inner<T, SLOTS> {
-        let current_epoch = 1;
+        let current_epoch = 4;
 
-        let local_epoch = AtomicU64::new(u64::MAX);
+        let local_epoch = AtomicU64::new(5);
         let local_progress_registry = SharedLocalState::new(local_epoch);
 
         let (orphan_tx, orphan_rx) = channel();
@@ -149,13 +174,14 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
             maintenance_lock: Arc::new(Mutex::new(orphan_rx)),
             orphan_tx,
             pins: 0,
+            local_concurrent_pins: 0,
         }
     }
 }
 
 impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
     fn clone(&self) -> Inner<T, SLOTS> {
-        let local_quiescent_epoch = AtomicU64::new(u64::MAX);
+        let local_quiescent_epoch = AtomicU64::new(self.global_current_epoch.load(Acquire) + 1);
 
         let local_progress_registry = self.local_progress_registry.insert(local_quiescent_epoch);
 
@@ -168,6 +194,7 @@ impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
             maintenance_lock: self.maintenance_lock.clone(),
             orphan_tx: self.orphan_tx.clone(),
             pins: 0,
+            local_concurrent_pins: 0,
         }
     }
 }
@@ -175,7 +202,8 @@ impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
 impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
     #[cold]
     fn maintenance(&mut self) {
-        let last_epoch = self.global_current_epoch.fetch_add(1, Release);
+        debug_delay();
+        let last_epoch = self.global_current_epoch.fetch_add(2, Release);
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
         } else {
@@ -187,23 +215,29 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
         // * bumping the global quiescent epoch
         // * clearing the orphan garbage queue
 
-        let global_minimum_epoch = self
-            .local_progress_registry
-            .fold(last_epoch, |min, this| min.min(this.load(Acquire)));
+        debug_delay();
+        let global_minimum_epoch = self.local_progress_registry.fold(last_epoch, |min, this| {
+            let value = this.load(Acquire);
+            let is_inactive = value & INACTIVE_BIT == INACTIVE_BIT;
+
+            // NB we can just ignore inactives
+            if is_inactive {
+                min
+            } else {
+                min.min(value)
+            }
+        });
 
         fence(Release);
 
         assert_ne!(global_minimum_epoch, u64::MAX);
 
+        debug_delay();
         self.global_minimum_epoch
             .fetch_max(global_minimum_epoch, Release);
 
         while let Ok(bag) = orphan_rx.try_recv() {
-            if bag.final_epoch.unwrap().get() < global_minimum_epoch {
-                drop(bag)
-            } else {
-                self.garbage_queue.push_back(bag);
-            }
+            self.garbage_queue.push_back(bag);
         }
     }
 }
@@ -215,10 +249,19 @@ pub struct Guard<'a, T: Send + 'static, const SLOTS: usize> {
 impl<'a, T: Send + 'static, const SLOTS: usize> Drop for Guard<'a, T, SLOTS> {
     fn drop(&mut self) {
         // set this to a large number to ensure it is not counted by `min_epoch()`
-        let inner = self.ebr.borrow();
-        inner
-            .local_progress_registry
-            .access_without_notification(|lqe| lqe.store(u64::MAX, Release));
+        let mut inner = self.ebr.borrow_mut();
+
+        debug_delay();
+
+        inner.local_concurrent_pins = inner.local_concurrent_pins.checked_sub(1).unwrap();
+
+        if inner.local_concurrent_pins == 0 {
+            debug_delay();
+            // adding 1 sets the INACTIVE_BIT
+            inner
+                .local_progress_registry
+                .access_without_notification(|lqe| lqe.fetch_add(1, Release));
+        }
     }
 }
 
@@ -229,13 +272,14 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
 
         if ebr.current_garbage_bag.is_full() {
             let mut full_bag = take(&mut ebr.current_garbage_bag);
+            debug_delay();
             let global_current_epoch = ebr.global_current_epoch.load(Acquire);
             full_bag.seal(global_current_epoch);
 
             ebr.garbage_queue.push_back(full_bag);
 
+            debug_delay();
             let global_minimum_epoch = ebr.global_minimum_epoch.load(Acquire);
-            assert!(global_minimum_epoch >= 1);
             let quiescent = global_minimum_epoch.checked_sub(1).unwrap();
 
             assert!(

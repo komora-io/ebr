@@ -53,7 +53,7 @@ fn ebr_multi_alloc_defer_free(b: &mut Bencher) {
 #[bench]
 fn ebr_multi_defer(b: &mut Bencher) {
     b.iter(|| {
-        let ebr: ebr::Ebr<()> = ebr::Ebr::default();
+        let ebr: ebr::Ebr<u32> = ebr::Ebr::default();
 
         scope(|s| {
             for _ in 0..THREADS {
@@ -61,7 +61,7 @@ fn ebr_multi_defer(b: &mut Bencher) {
                 s.spawn(move || {
                     for _ in 0..STEPS {
                         let mut guard = ebr.pin();
-                        guard.defer_drop(());
+                        guard.defer_drop(77);
                     }
                 });
             }
