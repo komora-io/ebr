@@ -12,7 +12,7 @@ const THREADS: usize = 16;
 const STEPS: usize = 10_000;
 
 #[bench]
-fn ebr_single_alloc_defer_free(b: &mut Bencher) {
+fn a_ebr_single_alloc_defer_free(b: &mut Bencher) {
     let ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
 
     b.iter(|| {
@@ -22,7 +22,7 @@ fn ebr_single_alloc_defer_free(b: &mut Bencher) {
 }
 
 #[bench]
-fn ebr_single_defer(b: &mut Bencher) {
+fn a_ebr_single_defer(b: &mut Bencher) {
     let ebr: ebr::Ebr<()> = ebr::Ebr::default();
 
     b.iter(|| {
@@ -32,7 +32,7 @@ fn ebr_single_defer(b: &mut Bencher) {
 }
 
 #[bench]
-fn ebr_multi_alloc_defer_free(b: &mut Bencher) {
+fn a_ebr_multi_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
         scope(|s| {
             let ebr: ebr::Ebr<Box<u64>> = ebr::Ebr::default();
@@ -51,7 +51,7 @@ fn ebr_multi_alloc_defer_free(b: &mut Bencher) {
 }
 
 #[bench]
-fn ebr_multi_defer(b: &mut Bencher) {
+fn a_ebr_multi_defer(b: &mut Bencher) {
     b.iter(|| {
         let ebr: ebr::Ebr<u32> = ebr::Ebr::default();
 
@@ -70,7 +70,7 @@ fn ebr_multi_defer(b: &mut Bencher) {
 }
 
 #[bench]
-fn crossbeam_single_alloc_defer_free(b: &mut Bencher) {
+fn b_crossbeam_single_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
         let guard = crossbeam_pin();
         unsafe {
@@ -80,7 +80,7 @@ fn crossbeam_single_alloc_defer_free(b: &mut Bencher) {
 }
 
 #[bench]
-fn crossbeam_single_defer(b: &mut Bencher) {
+fn b_crossbeam_single_defer(b: &mut Bencher) {
     b.iter(|| {
         let guard = crossbeam_pin();
         unsafe {
@@ -90,7 +90,7 @@ fn crossbeam_single_defer(b: &mut Bencher) {
 }
 
 #[bench]
-fn crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
+fn b_crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
     b.iter(|| {
         scope(|s| {
             for _ in 0..THREADS {
@@ -108,7 +108,7 @@ fn crossbeam_multi_alloc_defer_free(b: &mut Bencher) {
 }
 
 #[bench]
-fn crossbeam_multi_defer(b: &mut Bencher) {
+fn b_crossbeam_multi_defer(b: &mut Bencher) {
     b.iter(|| {
         scope(|s| {
             for _ in 0..THREADS {

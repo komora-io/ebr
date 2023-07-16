@@ -15,6 +15,3 @@ lock_free_delays = []
 
 [dev-dependencies]
 crossbeam-epoch = "0.9.8"
-
-[dependencies]
-shared-local-state = "0.1.1"

@@ -18,14 +18,12 @@ use std::{
     sync::{
         atomic::{
             fence, AtomicU64,
-            Ordering::{Acquire, Release},
+            Ordering::{Acquire, Relaxed, Release},
         },
         mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
 };
-
-use shared_local_state::SharedLocalState;
 
 const BUMP_EPOCH_OPS: u64 = 128;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
@@ -73,16 +71,11 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
         inner.pins += 1;
         inner.local_concurrent_pins += 1;
 
-        debug_delay();
-        let global_current_epoch = inner.global_current_epoch.load(Acquire);
-
         if inner.local_concurrent_pins == 1 {
+            assert_eq!(inner.pinned_epoch, None);
             debug_delay();
-            inner
-                .local_progress_registry
-                .access_without_notification(|lqe| {
-                    lqe.store(global_current_epoch, Release);
-                });
+            let pinned_epoch = inner.epoch_tracker.pin();
+            inner.pinned_epoch = Some(pinned_epoch);
         }
 
         let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_TRAILING_ZEROS;
@@ -110,16 +103,127 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Ebr<T, SLOTS> {
     }
 }
 
+const fn epoch_pin(current: u64) -> u64 {
+    let shift = match current & 0b11 {
+        0b00 => 2,
+        0b01 => 2 + 20,
+        0b10 => 2 + 40,
+        _ => unreachable!(),
+    };
+
+    current + (1 << shift)
+}
+
+const fn epoch_unpin(current: u64, epoch: Epoch) -> u64 {
+    let shift = match epoch {
+        Epoch::E0 => 2,
+        Epoch::E1 => 2 + 20,
+        Epoch::E2 => 2 + 40,
+        _ => unreachable!(),
+    };
+
+    current - (1 << shift)
+}
+
+const fn current_tenancy(current: u64) -> usize {
+    let shift = match current & 0b11 {
+        0b00 => 2,
+        0b01 => 2 + 20,
+        0b10 => 2 + 40,
+        _ => unreachable!(),
+    };
+
+    (current >> shift) as usize & 0xFFFFF
+}
+
+const fn advance_epoch(current: u64) -> u64 {
+    let advanced_low_bits = match current & 0b11 {
+        0b00 => 0b01,
+        0b01 => 0b10,
+        0b10 => 0b00,
+        _ => unreachable!(),
+    };
+
+    const EPOCH_MASK: u64 = u64::MAX - 0b11;
+
+    (current & EPOCH_MASK) + advanced_low_bits
+}
+
+const fn previous_tenancy(current: u64) -> usize {
+    let shift = match current & 0b11 {
+        0b00 => 2 + 40,
+        0b01 => 2,
+        0b10 => 2 + 20,
+        _ => unreachable!(),
+    };
+
+    (current >> shift) as usize & 0xFFFFF
+}
+
+const fn inactive_tenancy(current: u64) -> usize {
+    let shift = match current & 0b11 {
+        0b00 => 2 + 20,
+        0b01 => 2 + 40,
+        0b10 => 2,
+        _ => unreachable!(),
+    };
+
+    (current >> shift) as usize & 0xFFFFF
+}
+
+const fn epoch_to_enum(current: u64) -> Epoch {
+    match current & 0b11 {
+        0b00 => Epoch::E0,
+        0b01 => Epoch::E1,
+        0b10 => Epoch::E2,
+        _ => unreachable!(),
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct EpochTracker(Arc<AtomicU64>);
+
+impl EpochTracker {
+    // returns the epoch that we are pinned into, must
+    // be passed to unpin later on
+    fn pin(&self) -> Epoch {
+        let mut current = self.0.load(Relaxed);
+
+        loop {
+            let pinned = epoch_pin(current);
+            match self
+                .0
+                .compare_exchange_weak(current, pinned, Release, Acquire)
+            {
+                Ok(_) => return epoch_to_enum(pinned),
+                Err(c) => current = c,
+            }
+        }
+    }
+
+    fn unpin(&self, epoch: Epoch) {
+        let mut current = self.0.load(Relaxed);
+
+        loop {
+            let unpinned = epoch_unpin(current, epoch);
+            match self
+                .0
+                .compare_exchange_weak(current, unpinned, Release, Acquire)
+            {
+                Ok(_) => return,
+                Err(c) => current = c,
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Inner<T: Send + 'static, const SLOTS: usize> {
-    // shared quiescent epochs
-    local_progress_registry: SharedLocalState<AtomicU64>,
+    // shared state for doing epoch maintenance
+    epoch_tracker: EpochTracker,
 
-    // the highest epoch that gc is safe for
-    global_minimum_epoch: Arc<AtomicU64>,
-
-    // new garbage gets assigned this epoch
-    global_current_epoch: Arc<AtomicU64>,
+    // incremented after successfully advancing the epoch,
+    epoch_counter: Arc<AtomicU64>,
 
     // epoch-tagged garbage waiting to be safely dropped
     garbage_queue: VecDeque<Bag<T, SLOTS>>,
@@ -138,6 +242,9 @@ pub struct Inner<T: Send + 'static, const SLOTS: usize> {
 
     // pins on this thread
     local_concurrent_pins: usize,
+
+    // the epoch we're checked into
+    pinned_epoch: Option<Epoch>,
 }
 
 impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
@@ -150,7 +257,7 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
         if self.current_garbage_bag.len > 0 {
             let mut full_bag = take(&mut self.current_garbage_bag);
             debug_delay();
-            full_bag.seal(self.global_current_epoch.load(Acquire));
+            full_bag.seal(self.epoch_counter.load(Acquire));
             self.orphan_tx.send(full_bag).unwrap();
         }
     }
@@ -158,43 +265,62 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
 
 impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
     fn default() -> Inner<T, SLOTS> {
-        let current_epoch = 4;
-
-        let local_epoch = AtomicU64::new(5);
-        let local_progress_registry = SharedLocalState::new(local_epoch);
-
         let (orphan_tx, orphan_rx) = channel();
 
         Inner {
-            local_progress_registry,
-            global_current_epoch: Arc::new(AtomicU64::new(current_epoch)),
-            global_minimum_epoch: Arc::new(AtomicU64::new(current_epoch)),
+            epoch_tracker: EpochTracker::default(),
+            epoch_counter: Arc::new(AtomicU64::new(2)),
             garbage_queue: Default::default(),
             current_garbage_bag: Bag::default(),
             maintenance_lock: Arc::new(Mutex::new(orphan_rx)),
             orphan_tx,
             pins: 0,
             local_concurrent_pins: 0,
+            pinned_epoch: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Epoch {
+    E0 = 0,
+    E1 = 1,
+    E2 = 2,
+}
+
+impl Epoch {
+    fn successor(&self) -> Epoch {
+        use Epoch::*;
+        match self {
+            E0 => E1,
+            E1 => E2,
+            E2 => E0,
+        }
+    }
+
+    fn predecessor(&self) -> Epoch {
+        use Epoch::*;
+        match self {
+            E0 => E2,
+            E1 => E0,
+            E2 => E1,
         }
     }
 }
 
 impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
     fn clone(&self) -> Inner<T, SLOTS> {
-        let local_quiescent_epoch = AtomicU64::new(self.global_current_epoch.load(Acquire) + 1);
-
-        let local_progress_registry = self.local_progress_registry.insert(local_quiescent_epoch);
-
         Inner {
-            local_progress_registry,
-            global_minimum_epoch: self.global_minimum_epoch.clone(),
-            global_current_epoch: self.global_current_epoch.clone(),
+            epoch_tracker: self.epoch_tracker.clone(),
+            epoch_counter: self.epoch_counter.clone(),
             garbage_queue: Default::default(),
             current_garbage_bag: Bag::default(),
             maintenance_lock: self.maintenance_lock.clone(),
             orphan_tx: self.orphan_tx.clone(),
             pins: 0,
             local_concurrent_pins: 0,
+            pinned_epoch: None,
         }
     }
 }
@@ -203,7 +329,6 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
     #[cold]
     fn maintenance(&mut self) {
         debug_delay();
-        let last_epoch = self.global_current_epoch.fetch_add(2, Release);
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
         } else {
@@ -215,26 +340,33 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
         // * bumping the global quiescent epoch
         // * clearing the orphan garbage queue
 
-        debug_delay();
-        let global_minimum_epoch = self.local_progress_registry.fold(last_epoch, |min, this| {
-            let value = this.load(Acquire);
-            let is_inactive = value & INACTIVE_BIT == INACTIVE_BIT;
+        let mut current = self.epoch_tracker.0.load(Relaxed);
 
-            // NB we can just ignore inactives
-            if is_inactive {
-                min
-            } else {
-                min.min(value)
+        let advanced = loop {
+            if previous_tenancy(current) > 0 {
+                break false;
             }
-        });
+
+            let bumped_epoch = advance_epoch(current);
+            match self.epoch_tracker.0.compare_exchange_weak(
+                current,
+                bumped_epoch,
+                Release,
+                Relaxed,
+            ) {
+                Ok(_) => break true,
+                Err(c) => current = c,
+            }
+        };
+
+        if advanced {
+            debug_delay();
+            self.epoch_counter.fetch_add(1, Release);
+        }
+
+        debug_delay();
 
         fence(Release);
-
-        assert_ne!(global_minimum_epoch, u64::MAX);
-
-        debug_delay();
-        self.global_minimum_epoch
-            .fetch_max(global_minimum_epoch, Release);
 
         while let Ok(bag) = orphan_rx.try_recv() {
             self.garbage_queue.push_back(bag);
@@ -256,11 +388,18 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Drop for Guard<'a, T, SLOTS> {
         inner.local_concurrent_pins = inner.local_concurrent_pins.checked_sub(1).unwrap();
 
         if inner.local_concurrent_pins == 0 {
-            debug_delay();
-            // adding 1 sets the INACTIVE_BIT
-            inner
-                .local_progress_registry
-                .access_without_notification(|lqe| lqe.fetch_add(1, Release));
+            let pinned_epoch = inner.pinned_epoch.take().unwrap();
+            inner.epoch_tracker.unpin(pinned_epoch);
+            let safe_to_gc = inner.epoch_counter.load(Acquire).checked_sub(2).unwrap();
+
+            while let Some(front) = inner.garbage_queue.front() {
+                if front.final_epoch.unwrap().get() > safe_to_gc {
+                    break;
+                }
+
+                let bag = inner.garbage_queue.pop_front().unwrap();
+                drop(bag);
+            }
         }
     }
 }
@@ -273,14 +412,13 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
         if ebr.current_garbage_bag.is_full() {
             let mut full_bag = take(&mut ebr.current_garbage_bag);
             debug_delay();
-            let global_current_epoch = ebr.global_current_epoch.load(Acquire);
+            let global_current_epoch = ebr.epoch_counter.load(Acquire);
             full_bag.seal(global_current_epoch);
 
             ebr.garbage_queue.push_back(full_bag);
 
             debug_delay();
-            let global_minimum_epoch = ebr.global_minimum_epoch.load(Acquire);
-            let quiescent = global_minimum_epoch.checked_sub(1).unwrap();
+            let quiescent = global_current_epoch.checked_sub(2).unwrap();
 
             assert!(
                 global_current_epoch > quiescent,
