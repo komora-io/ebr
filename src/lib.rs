@@ -30,7 +30,6 @@ use shared_local_state::SharedLocalState;
 const BUMP_EPOCH_OPS: u64 = 128;
 const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
 const INACTIVE_BIT: u64 = 0b1;
-const INACTIVE_MASK: u64 = u64::MAX - INACTIVE_BIT;
 
 #[cfg(not(feature = "lock_free_delays"))]
 #[inline]
@@ -73,16 +72,27 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
         inner.pins += 1;
         inner.local_concurrent_pins += 1;
 
-        debug_delay();
-        let global_current_epoch = inner.global_current_epoch.load(Acquire);
-
         if inner.local_concurrent_pins == 1 {
-            debug_delay();
-            inner
-                .local_progress_registry
-                .access_without_notification(|lqe| {
-                    lqe.store(global_current_epoch, Release);
-                });
+            let mut global_current_epoch = inner.global_current_epoch.load(Acquire);
+            loop {
+                debug_delay();
+                inner
+                    .local_progress_registry
+                    .access_without_notification(|lqe| {
+                        lqe.store(global_current_epoch, Release);
+                    });
+
+                // here we optimistically linearize w/ the global_current_epoch
+                // by doing a second read and repeating the store until what we
+                // stored equals the current epoch after storage.
+                let second_read = inner.global_current_epoch.load(Acquire);
+
+                if second_read == global_current_epoch {
+                    break;
+                } else {
+                    global_current_epoch = second_read;
+                }
+            }
         }
 
         let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_TRAILING_ZEROS;
@@ -203,6 +213,7 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
     #[cold]
     fn maintenance(&mut self) {
         debug_delay();
+        // we bump by 2 because 1 represents the inactive bit.
         let last_epoch = self.global_current_epoch.fetch_add(2, Release);
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
@@ -216,7 +227,8 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
         // * clearing the orphan garbage queue
 
         debug_delay();
-        let global_minimum_epoch = self.local_progress_registry.fold(last_epoch, |min, this| {
+
+        let minimum_fold_closure = |min: u64, this: &AtomicU64| {
             let value = this.load(Acquire);
             let is_inactive = value & INACTIVE_BIT == INACTIVE_BIT;
 
@@ -226,7 +238,11 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
             } else {
                 min.min(value)
             }
-        });
+        };
+
+        let global_minimum_epoch = self
+            .local_progress_registry
+            .fold(last_epoch, minimum_fold_closure);
 
         fence(Release);
 
