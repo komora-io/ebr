@@ -24,8 +24,6 @@ use std::{
 
 use shared_local_state::SharedLocalState;
 
-const BUMP_EPOCH_OPS: u64 = 128;
-const BUMP_EPOCH_TRAILING_ZEROS: u32 = BUMP_EPOCH_OPS.trailing_zeros();
 const INACTIVE_BIT: u64 = 0b1;
 
 #[cfg(not(feature = "lock_free_delays"))]
@@ -34,8 +32,13 @@ fn debug_delay() {}
 
 #[cfg(feature = "lock_free_delays")]
 fn debug_delay() {
-    for i in 0..2 {
-        std::thread::yield_now();
+    use rand::distributions::Distribution;
+
+    let mut rng = rand::thread_rng();
+    let zipf = zipf::ZipfDistribution::new(70, 1.03).unwrap();
+    let sample = zipf.sample(&mut rng);
+    if sample > 10 {
+        std::thread::sleep(std::time::Duration::from_micros(sample as u64));
     }
 }
 
@@ -43,7 +46,7 @@ fn _test_impls() {
     fn send<T: Send>() {}
 
     send::<Ebr<()>>();
-    send::<Inner<(), 128>>();
+    send::<Inner<(), 128, 8>>();
 }
 
 /// Epoch-based garbage collector with extremely efficient
@@ -59,12 +62,14 @@ fn _test_impls() {
 /// to cooperatively reclaim after any potentially witnessing
 /// thread has finished its work.
 #[derive(Debug)]
-pub struct Ebr<T: Send + 'static, const SLOTS: usize = 128> {
-    inner: RefCell<Inner<T, SLOTS>>,
+pub struct Ebr<T: Send + 'static, const SLOTS: usize = 128, const BUMP_EPOCH_OPS: usize = 128> {
+    inner: RefCell<Inner<T, SLOTS, BUMP_EPOCH_OPS>>,
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
-    pub fn pin(&self) -> Guard<'_, T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
+    Ebr<T, SLOTS, BUMP_EPOCH_OPS>
+{
+    pub fn pin(&self) -> Guard<'_, T, SLOTS, BUMP_EPOCH_OPS> {
         let mut inner = self.inner.borrow_mut();
         inner.pins += 1;
         inner.local_concurrent_pins += 1;
@@ -79,6 +84,9 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
                         lqe.store(global_current_epoch, Ordering::Release);
                     });
 
+                // without this fence, concurrency tests fail on ARM.
+                fence(Ordering::Release);
+
                 // here we optimistically linearize w/ the global_current_epoch
                 // by doing a second read and repeating the store until what we
                 // stored equals the current epoch after storage.
@@ -92,7 +100,7 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
             }
         }
 
-        let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_TRAILING_ZEROS;
+        let should_bump_epoch = inner.pins.trailing_zeros() >= BUMP_EPOCH_OPS.trailing_zeros();
         if should_bump_epoch {
             inner.maintenance();
         }
@@ -101,7 +109,9 @@ impl<T: Send + 'static, const SLOTS: usize> Ebr<T, SLOTS> {
     }
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Clone for Ebr<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Clone
+    for Ebr<T, SLOTS, BUMP_EPOCH_OPS>
+{
     fn clone(&self) -> Self {
         Ebr {
             inner: RefCell::new(self.inner.borrow().clone()),
@@ -109,8 +119,10 @@ impl<T: Send + 'static, const SLOTS: usize> Clone for Ebr<T, SLOTS> {
     }
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Default for Ebr<T, SLOTS> {
-    fn default() -> Ebr<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Default
+    for Ebr<T, SLOTS, BUMP_EPOCH_OPS>
+{
+    fn default() -> Ebr<T, SLOTS, BUMP_EPOCH_OPS> {
         Ebr {
             inner: Default::default(),
         }
@@ -118,7 +130,7 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Ebr<T, SLOTS> {
 }
 
 #[derive(Debug)]
-pub struct Inner<T: Send + 'static, const SLOTS: usize> {
+pub struct Inner<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> {
     // shared quiescent epochs
     local_progress_registry: SharedLocalState<AtomicU64>,
 
@@ -147,7 +159,9 @@ pub struct Inner<T: Send + 'static, const SLOTS: usize> {
     local_concurrent_pins: usize,
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Drop
+    for Inner<T, SLOTS, BUMP_EPOCH_OPS>
+{
     fn drop(&mut self) {
         // Send all outstanding garbage to the orphan queue.
         for old_bag in take(&mut self.garbage_queue) {
@@ -179,8 +193,10 @@ impl<T: Send + 'static, const SLOTS: usize> Drop for Inner<T, SLOTS> {
     }
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
-    fn default() -> Inner<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Default
+    for Inner<T, SLOTS, BUMP_EPOCH_OPS>
+{
+    fn default() -> Inner<T, SLOTS, BUMP_EPOCH_OPS> {
         let current_epoch = 2;
 
         let local_epoch = AtomicU64::new(3);
@@ -202,8 +218,10 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Inner<T, SLOTS> {
     }
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
-    fn clone(&self) -> Inner<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Clone
+    for Inner<T, SLOTS, BUMP_EPOCH_OPS>
+{
+    fn clone(&self) -> Inner<T, SLOTS, BUMP_EPOCH_OPS> {
         let local_quiescent_epoch =
             AtomicU64::new(self.global_current_epoch.load(Ordering::Acquire) + 1);
 
@@ -223,9 +241,16 @@ impl<T: Send + 'static, const SLOTS: usize> Clone for Inner<T, SLOTS> {
     }
 }
 
-impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
+impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
+    Inner<T, SLOTS, BUMP_EPOCH_OPS>
+{
     #[cold]
     fn maintenance(&mut self) {
+        self.bump_quiescent();
+        self.clean_up();
+    }
+
+    fn bump_quiescent(&mut self) {
         let orphan_rx = if let Ok(orphan_rx) = self.maintenance_lock.try_lock() {
             orphan_rx
         } else {
@@ -233,6 +258,7 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
         };
 
         debug_delay();
+
         // we bump by 2 because 1 represents the inactive bit.
         let last_epoch = self.global_current_epoch.fetch_add(2, Ordering::Release);
 
@@ -264,20 +290,51 @@ impl<T: Send + 'static, const SLOTS: usize> Inner<T, SLOTS> {
         assert_ne!(global_minimum_epoch, u64::MAX);
 
         debug_delay();
-        self.global_minimum_epoch
+
+        let fetch_max_response = self
+            .global_minimum_epoch
             .fetch_max(global_minimum_epoch, Ordering::Release);
 
+        let fetch_max = fetch_max_response.max(global_minimum_epoch);
+
+        let quiescent = fetch_max.checked_sub(2).unwrap();
+
         while let Ok(bag) = orphan_rx.try_recv() {
-            self.garbage_queue.push_back(bag);
+            if bag.final_epoch.unwrap().get() > quiescent {
+                self.garbage_queue.push_back(bag);
+            } else {
+                // bag is already safe to drop
+                drop(bag);
+            }
+        }
+    }
+
+    fn clean_up(&mut self) {
+        let global_minimum_epoch = self.global_minimum_epoch.load(Ordering::Acquire);
+
+        debug_delay();
+
+        let quiescent = global_minimum_epoch.checked_sub(2).unwrap();
+
+        while let Some(front) = self.garbage_queue.front() {
+            if front.final_epoch.unwrap().get() > quiescent {
+                break;
+            }
+
+            let bag = self.garbage_queue.pop_front().unwrap();
+            drop(bag);
         }
     }
 }
 
-pub struct Guard<'a, T: Send + 'static, const SLOTS: usize> {
-    ebr: &'a RefCell<Inner<T, SLOTS>>,
+pub struct Guard<'a, T: Send + 'static, const SLOTS: usize = 128, const BUMP_EPOCH_OPS: usize = 128>
+{
+    ebr: &'a RefCell<Inner<T, SLOTS, BUMP_EPOCH_OPS>>,
 }
 
-impl<'a, T: Send + 'static, const SLOTS: usize> Drop for Guard<'a, T, SLOTS> {
+impl<'a, T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Drop
+    for Guard<'a, T, SLOTS, BUMP_EPOCH_OPS>
+{
     fn drop(&mut self) {
         // set this to a large number to ensure it is not counted by `min_epoch()`
         let mut inner = self.ebr.borrow_mut();
@@ -288,64 +345,56 @@ impl<'a, T: Send + 'static, const SLOTS: usize> Drop for Guard<'a, T, SLOTS> {
 
         if inner.local_concurrent_pins == 0 {
             debug_delay();
-            // adding 1 sets the INACTIVE_BIT
             inner
                 .local_progress_registry
-                .access_without_notification(|lqe| lqe.fetch_add(1, Ordering::Release));
+                .access_without_notification(|lqe| {
+                    let last = lqe.fetch_and(INACTIVE_BIT, Ordering::Release);
+                    let global_minimum_epoch = inner.global_minimum_epoch.load(Ordering::Acquire);
+
+                    assert!(
+                        global_minimum_epoch <= last,
+                        "global minimum: {global_minimum_epoch}, ours: {last}"
+                    );
+                });
         }
     }
 }
 
-impl<'a, T: Send + 'static, const SLOTS: usize> Guard<'a, T, SLOTS> {
+impl<'a, T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
+    Guard<'a, T, SLOTS, BUMP_EPOCH_OPS>
+{
     pub fn defer_drop(&mut self, item: T) {
         let mut ebr = self.ebr.borrow_mut();
         ebr.current_garbage_bag.push(item);
 
-        if ebr.current_garbage_bag.is_full() {
-            let mut full_bag = take(&mut ebr.current_garbage_bag);
+        if !ebr.current_garbage_bag.is_full() {
+            return;
+        }
+
+        let mut full_bag = take(&mut ebr.current_garbage_bag);
+
+        debug_delay();
+        let mut global_current_epoch = ebr.global_current_epoch.load(Ordering::Acquire);
+
+        loop {
+            // We use optimistic double-reading here to ensure our seal is linearized
+            // with the current epoch.
+            full_bag.seal(global_current_epoch);
 
             debug_delay();
-            let mut global_current_epoch = ebr.global_current_epoch.load(Ordering::Acquire);
 
-            loop {
-                // We use optimistic double-reading here to ensure our seal is linearized
-                // with the current epoch.
-                full_bag.seal(global_current_epoch);
+            let second_read = ebr.global_current_epoch.load(Ordering::Acquire);
 
-                debug_delay();
-
-                let second_read = ebr.global_current_epoch.load(Ordering::Acquire);
-
-                if second_read == global_current_epoch {
-                    break;
-                } else {
-                    global_current_epoch = second_read;
-                }
-            }
-
-            ebr.garbage_queue.push_back(full_bag);
-
-            debug_delay();
-            let global_minimum_epoch = ebr.global_minimum_epoch.load(Ordering::Acquire);
-            let quiescent = global_minimum_epoch.checked_sub(2).unwrap();
-
-            assert!(
-                global_current_epoch > quiescent,
-                "expected global_current_epoch \
-                {} to be > quiescent {}",
-                global_current_epoch,
-                quiescent
-            );
-
-            while let Some(front) = ebr.garbage_queue.front() {
-                if front.final_epoch.unwrap().get() > quiescent {
-                    break;
-                }
-
-                let bag = ebr.garbage_queue.pop_front().unwrap();
-                drop(bag);
+            if second_read == global_current_epoch {
+                break;
+            } else {
+                global_current_epoch = second_read;
             }
         }
+
+        ebr.garbage_queue.push_back(full_bag);
+
+        ebr.clean_up();
     }
 }
 
@@ -391,5 +440,27 @@ impl<T: Send + 'static, const SLOTS: usize> Default for Bag<T, SLOTS> {
             len: 0,
             garbage: unsafe { MaybeUninit::<[MaybeUninit<T>; SLOTS]>::uninit().assume_init() },
         }
+    }
+}
+
+#[test]
+fn concurrent_free() {
+    const THREADS: usize = 16;
+    const STEPS: usize = 10_000;
+
+    for _ in 0..1000 {
+        std::thread::scope(|s| {
+            let ebr: Ebr<u32> = Ebr::default();
+
+            for _ in 0..THREADS {
+                let ebr = ebr.clone();
+                s.spawn(move || {
+                    for _ in 0..STEPS {
+                        let mut guard = ebr.pin();
+                        guard.defer_drop(77);
+                    }
+                });
+            }
+        })
     }
 }
