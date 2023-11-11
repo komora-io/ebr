@@ -26,22 +26,6 @@ use shared_local_state::SharedLocalState;
 
 const INACTIVE_BIT: u64 = 0b1;
 
-#[cfg(not(feature = "lock_free_delays"))]
-#[inline]
-fn debug_delay() {}
-
-#[cfg(feature = "lock_free_delays")]
-fn debug_delay() {
-    use rand::distributions::Distribution;
-
-    let mut rng = rand::thread_rng();
-    let zipf = zipf::ZipfDistribution::new(70, 1.03).unwrap();
-    let sample = zipf.sample(&mut rng);
-    if sample > 10 {
-        std::thread::sleep(std::time::Duration::from_micros(sample as u64));
-    }
-}
-
 fn _test_impls() {
     fn send<T: Send>() {}
 
@@ -69,6 +53,12 @@ pub struct Ebr<T: Send + 'static, const SLOTS: usize = 128, const BUMP_EPOCH_OPS
 impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
     Ebr<T, SLOTS, BUMP_EPOCH_OPS>
 {
+    #[doc(hidden)]
+    pub fn manually_advance_epoch(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.maintenance();
+    }
+
     pub fn pin(&self) -> Guard<'_, T, SLOTS, BUMP_EPOCH_OPS> {
         let mut inner = self.inner.borrow_mut();
         inner.pins += 1;
@@ -76,8 +66,9 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
 
         if inner.local_concurrent_pins == 1 {
             let mut global_current_epoch = inner.global_current_epoch.load(Ordering::Acquire);
+            assert_ne!(global_current_epoch & INACTIVE_BIT, INACTIVE_BIT);
+            assert_ne!(global_current_epoch, 0);
             loop {
-                debug_delay();
                 inner
                     .local_progress_registry
                     .access_without_notification(|lqe| {
@@ -170,15 +161,12 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Drop
 
         if self.current_garbage_bag.len > 0 {
             let mut full_bag = take(&mut self.current_garbage_bag);
-            debug_delay();
             let mut global_current_epoch = self.global_current_epoch.load(Ordering::Acquire);
 
             loop {
                 // We use optimistic double-reading here to ensure our seal is linearized
                 // with the current epoch.
                 full_bag.seal(global_current_epoch);
-
-                debug_delay();
 
                 let second_read = self.global_current_epoch.load(Ordering::Acquire);
 
@@ -197,9 +185,12 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Default
     for Inner<T, SLOTS, BUMP_EPOCH_OPS>
 {
     fn default() -> Inner<T, SLOTS, BUMP_EPOCH_OPS> {
-        let current_epoch = 2;
+        let current_epoch = INACTIVE_BIT << 1;
 
-        let local_epoch = AtomicU64::new(3);
+        let local_epoch_value = current_epoch | INACTIVE_BIT;
+        assert_ne!(local_epoch_value, 0);
+        let local_epoch = AtomicU64::new(local_epoch_value);
+
         let local_progress_registry = SharedLocalState::new(local_epoch);
 
         let (orphan_tx, orphan_rx) = channel();
@@ -222,10 +213,7 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Clone
     for Inner<T, SLOTS, BUMP_EPOCH_OPS>
 {
     fn clone(&self) -> Inner<T, SLOTS, BUMP_EPOCH_OPS> {
-        let local_quiescent_epoch =
-            AtomicU64::new(self.global_current_epoch.load(Ordering::Acquire) + 1);
-
-        let local_progress_registry = self.local_progress_registry.insert(local_quiescent_epoch);
+        let local_progress_registry = self.local_progress_registry.insert(INACTIVE_BIT.into());
 
         Inner {
             local_progress_registry,
@@ -257,8 +245,6 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
             return;
         };
 
-        debug_delay();
-
         // we bump by 2 because 1 represents the inactive bit.
         let last_epoch = self.global_current_epoch.fetch_add(2, Ordering::Release);
 
@@ -267,11 +253,10 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
         // * bumping the global quiescent epoch
         // * clearing the orphan garbage queue
 
-        debug_delay();
-
         let minimum_fold_closure = |min: u64, this: &AtomicU64| {
             let value = this.load(Ordering::Acquire);
             let is_inactive = value & INACTIVE_BIT == INACTIVE_BIT;
+            assert_ne!(value, 0);
 
             // NB we can just ignore inactives
             if is_inactive {
@@ -288,8 +273,6 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
         fence(Ordering::Release);
 
         assert_ne!(global_minimum_epoch, u64::MAX);
-
-        debug_delay();
 
         let fetch_max_response = self
             .global_minimum_epoch
@@ -311,8 +294,6 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
 
     fn clean_up(&mut self) {
         let global_minimum_epoch = self.global_minimum_epoch.load(Ordering::Acquire);
-
-        debug_delay();
 
         let quiescent = global_minimum_epoch.checked_sub(2).unwrap();
 
@@ -339,18 +320,16 @@ impl<'a, T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize> Dro
         // set this to a large number to ensure it is not counted by `min_epoch()`
         let mut inner = self.ebr.borrow_mut();
 
-        debug_delay();
-
         inner.local_concurrent_pins = inner.local_concurrent_pins.checked_sub(1).unwrap();
 
         if inner.local_concurrent_pins == 0 {
-            debug_delay();
             inner
                 .local_progress_registry
                 .access_without_notification(|lqe| {
-                    let last = lqe.fetch_and(INACTIVE_BIT, Ordering::Release);
                     let global_minimum_epoch = inner.global_minimum_epoch.load(Ordering::Acquire);
+                    let last = lqe.fetch_or(INACTIVE_BIT, Ordering::Release);
 
+                    assert_ne!(last, 0);
                     assert!(
                         global_minimum_epoch <= last,
                         "global minimum: {global_minimum_epoch}, ours: {last}"
@@ -373,15 +352,12 @@ impl<'a, T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
 
         let mut full_bag = take(&mut ebr.current_garbage_bag);
 
-        debug_delay();
         let mut global_current_epoch = ebr.global_current_epoch.load(Ordering::Acquire);
 
         loop {
             // We use optimistic double-reading here to ensure our seal is linearized
             // with the current epoch.
             full_bag.seal(global_current_epoch);
-
-            debug_delay();
 
             let second_read = ebr.global_current_epoch.load(Ordering::Acquire);
 
