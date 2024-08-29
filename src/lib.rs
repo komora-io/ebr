@@ -437,6 +437,12 @@ fn concurrent_free() {
                     }
                 });
             }
+
+            s.spawn(move || {
+                for _ in 0..STEPS {
+                    ebr.manually_advance_epoch()
+                }
+            });
         })
     }
 }
