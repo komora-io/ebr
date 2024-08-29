@@ -75,8 +75,8 @@ impl<T: Send + 'static, const SLOTS: usize, const BUMP_EPOCH_OPS: usize>
                         lqe.store(global_current_epoch, Ordering::Release);
                     });
 
-                // without this fence, concurrency tests fail on ARM.
-                fence(Ordering::Release);
+                // without this fence, concurrency tests fail on ARM and x86_64.
+                fence(Ordering::SeqCst);
 
                 // here we optimistically linearize w/ the global_current_epoch
                 // by doing a second read and repeating the store until what we
